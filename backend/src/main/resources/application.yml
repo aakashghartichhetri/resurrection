@@ -1,0 +1,17 @@
+server:
+  port: 8081
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/resurrection}
+    username: ${SPRING_DATASOURCE_USERNAME:resurrection}
+    password: ${SPRING_DATASOURCE_PASSWORD:resurrection_dev}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+app:
+  username: ${APP_USERNAME:resurrection}
+  password: ${APP_PASSWORD:dev-only-change-me}
+  seed-demo: ${APP_SEED_DEMO:true}
