@@ -1,7 +1,8 @@
 FROM node:22.16.0-alpine AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm install --no-audit --no-fund
+COPY package*.json ./
+# Use a lockfile when present; fresh source archives also work before the first lock is generated.
+RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 COPY . .
 RUN npm run build
 

@@ -7,5 +7,6 @@ import java.util.UUID;
 
 public interface EventRepository extends JpaRepository<EventEntity, Long> {
     List<EventEntity> findByWorkflowIdOrderBySequenceAsc(UUID workflowId);
+    List<EventEntity> findTop12ByOrderByCreatedAtDescIdDesc();
     Optional<EventEntity> findFirstByWorkflowIdOrderBySequenceDesc(UUID workflowId);
 }
