@@ -7,6 +7,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import java.util.UUID;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import static org.junit.jupiter.api.Assertions.*;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -37,6 +44,7 @@ class WorkflowIntegrationTest {
 
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper mapper;
+    @Autowired JdbcTemplate jdbc;
 
     @Test
     void unauthenticatedRequestsAreRejected() throws Exception {
@@ -64,15 +72,16 @@ class WorkflowIntegrationTest {
                 .andExpect(jsonPath("$.action").value("RESUME_AFTER_FAILURE"))
                 .andExpect(jsonPath("$.simulatedStatus").value("ACTIVE"))
                 .andReturn().getResponse().getContentAsString();
-        long seq = mapper.readTree(body).get("expectedSequence").asLong();
-        authorizedPost("/api/workflows/" + id + "/recover",
-                "{\"action\":\"RESUME_AFTER_FAILURE\",\"expectedSequence\":" + seq + "}")
+        recover(id, "RESUME_AFTER_FAILURE", body)
                 .andExpect(jsonPath("$.status").value("ACTIVE"));
         authorizedPost("/api/workflows/" + id + "/advance", null)
                 .andExpect(jsonPath("$.step").value("PACKED"));
         mvc.perform(get("/api/workflows/" + id).with(httpBasic("resurrection", "dev-only-change-me")))
                 .andExpect(jsonPath("$.events.length()").value(6))
-                .andExpect(jsonPath("$.checkpointCount").value(3));
+                .andExpect(jsonPath("$.checkpointCount").value(3))
+                .andExpect(jsonPath("$.approvals[0].actor").value("resurrection"))
+                .andExpect(jsonPath("$.approvals[0].action").value("RESUME_AFTER_FAILURE"))
+                .andExpect(jsonPath("$.faultAudits[0].actor").value("resurrection"));
     }
 
     @Test
@@ -87,17 +96,174 @@ class WorkflowIntegrationTest {
                 .andExpect(jsonPath("$.projectionMatches").value(false))
                 .andExpect(jsonPath("$.action").value("REBUILD_PROJECTION"))
                 .andReturn().getResponse().getContentAsString();
-        long seq = mapper.readTree(proposal).get("expectedSequence").asLong();
-        authorizedPost("/api/workflows/" + id + "/recover",
-                "{\"action\":\"REBUILD_PROJECTION\",\"expectedSequence\":" + seq + "}")
+        recover(id, "REBUILD_PROJECTION", proposal)
                 .andExpect(jsonPath("$.step").value("VALIDATED"));
-        authorizedPost("/api/workflows/" + id + "/recover",
-                "{\"action\":\"REBUILD_PROJECTION\",\"expectedSequence\":" + seq + "}")
+        recover(id, "REBUILD_PROJECTION", proposal)
                 .andExpect(status().isConflict());
         mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
                 .with(httpBasic("resurrection", "dev-only-change-me")))
                 .andExpect(jsonPath("$.projectionMatches").value(true))
                 .andExpect(jsonPath("$.action").value("NONE"));
+    }
+
+    @Test
+    void rebuildingAnArmedWorkflowPreservesItsPendingFault() throws Exception {
+        String id = create("Pending fault replay demo");
+        authorizedPost("/api/workflows/" + id + "/faults", "{\"type\":\"FAIL_NEXT_STEP\"}")
+                .andExpect(jsonPath("$.failNextStep").value(true));
+        authorizedPost("/api/workflows/" + id + "/faults", "{\"type\":\"CORRUPT_PROJECTION\"}")
+                .andExpect(status().isOk());
+        String preview = mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(jsonPath("$.expectedFaultArmed").value(true))
+                .andExpect(jsonPath("$.verifiedCheckpoints").value(1))
+                .andReturn().getResponse().getContentAsString();
+        recover(id, "REBUILD_PROJECTION", preview)
+                .andExpect(jsonPath("$.failNextStep").value(true));
+        authorizedPost("/api/workflows/" + id + "/advance", null)
+                .andExpect(jsonPath("$.status").value("FAILED"));
+    }
+
+    @Test
+    void requestIdempotencyProtectsAgainstDuplicateNetworkDelivery() throws Exception {
+        String id = create("Retry protection demo");
+        String key = UUID.randomUUID().toString();
+        String first = authorizedPost("/api/workflows/" + id + "/advance", null, key)
+                .andExpect(jsonPath("$.lastSequence").value(2))
+                .andReturn().getResponse().getContentAsString();
+        String second = authorizedPost("/api/workflows/" + id + "/advance", null, key)
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertEquals(first, second);
+        mvc.perform(get("/api/workflows/" + id).with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(jsonPath("$.events.length()").value(2));
+        String anotherId = create("Another workflow");
+        authorizedPost("/api/workflows/" + anotherId + "/advance", null, key)
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    void staleProjectionFingerprintBlocksRecoveryApproval() throws Exception {
+        String id = create("Stale approval demo");
+        authorizedPost("/api/workflows/" + id + "/faults", "{\"type\":\"FAIL_NEXT_STEP\"}")
+                .andExpect(status().isOk());
+        authorizedPost("/api/workflows/" + id + "/advance", null).andExpect(status().isOk());
+        String preview = mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andReturn().getResponse().getContentAsString();
+        // This direct database mutation changes projection without appending a new event.
+        jdbc.update("UPDATE workflows SET step = 2 WHERE id = ?", UUID.fromString(id));
+        recover(id, "RESUME_AFTER_FAILURE", preview).andExpect(status().isConflict());
+        mvc.perform(get("/api/workflows/" + id).with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(jsonPath("$.approvals.length()").value(0));
+    }
+
+    @Test
+    void refusesTamperedHistoryInsteadOfGuessingARepair() throws Exception {
+        String id = create("Tamper protection demo");
+        jdbc.update("UPDATE workflow_events SET message = 'forged' WHERE workflow_id = ? AND sequence_number = 1",
+                UUID.fromString(id));
+        mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("integrity")));
+    }
+
+    @Test
+    void missingCheckpointBlocksRecoveryAndFlagsTheWorkflow() throws Exception {
+        String id = create("Missing checkpoint investigation");
+        authorizedPost("/api/workflows/" + id + "/advance", null).andExpect(status().isOk());
+        jdbc.update("DELETE FROM workflow_checkpoints WHERE workflow_id = ? AND sequence_number = 2",
+                UUID.fromString(id));
+        mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("checkpoint")));
+        String raw = mvc.perform(get("/api/operations")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        JsonNode entries = mapper.readTree(raw).get("workflows");
+        for (JsonNode entry : entries) {
+            if (id.equals(entry.get("id").asText())) {
+                assertEquals("HISTORY_INVALID", entry.get("state").asText());
+                return;
+            }
+        }
+        fail("Missing-checkpoint workflow was absent from operations");
+    }
+
+    @Test
+    void operationsOverviewFindsRecoverableFailuresAndProjectionDrift() throws Exception {
+        String failedId = create("Fleet failed shipment");
+        String driftedId = create("Fleet inconsistent shipment");
+        authorizedPost("/api/workflows/" + failedId + "/faults", "{\"type\":\"FAIL_NEXT_STEP\"}")
+                .andExpect(status().isOk());
+        authorizedPost("/api/workflows/" + failedId + "/advance", null)
+                .andExpect(jsonPath("$.status").value("FAILED"));
+        authorizedPost("/api/workflows/" + driftedId + "/faults", "{\"type\":\"CORRUPT_PROJECTION\"}")
+                .andExpect(status().isOk());
+
+        String raw = mvc.perform(get("/api/operations")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode overview = mapper.readTree(raw);
+        assertTrue(overview.get("attention").asLong() >= 2);
+        Map<String, String> states = new java.util.HashMap<>();
+        overview.get("workflows").forEach(item -> states.put(item.get("id").asText(),
+                item.get("state").asText()));
+        assertEquals("FAILED", states.get(failedId));
+        assertEquals("DRIFTED", states.get(driftedId));
+    }
+
+    @Test
+    void operationsShowsHistoryIntegrityErrorsWithoutProposingRecovery() throws Exception {
+        String id = create("Fleet altered event history");
+        jdbc.update("UPDATE workflow_events SET message = 'edited' WHERE workflow_id = ? AND sequence_number = 1",
+                UUID.fromString(id));
+        String raw = mvc.perform(get("/api/operations")
+                        .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode entries = mapper.readTree(raw).get("workflows");
+        boolean found = false;
+        for (JsonNode entry : entries) {
+            if (id.equals(entry.get("id").asText())) {
+                assertEquals("HISTORY_INVALID", entry.get("state").asText());
+                found = true;
+            }
+        }
+        assertTrue(found);
+    }
+
+    @Test
+    void serializesTwoConcurrentAdvancesWithoutLosingSequenceNumbers() throws Exception {
+        String id = create("Concurrent command demo");
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var first = executor.submit(() -> authorizedPost("/api/workflows/" + id + "/advance", null,
+                    UUID.randomUUID().toString()).andReturn().getResponse().getStatus());
+            var second = executor.submit(() -> authorizedPost("/api/workflows/" + id + "/advance", null,
+                    UUID.randomUUID().toString()).andReturn().getResponse().getStatus());
+            assertEquals(200, first.get(20, TimeUnit.SECONDS).intValue());
+            assertEquals(200, second.get(20, TimeUnit.SECONDS).intValue());
+            mvc.perform(get("/api/workflows/" + id).with(httpBasic("resurrection", "dev-only-change-me")))
+                    .andExpect(jsonPath("$.workflow.lastSequence").value(3))
+                    .andExpect(jsonPath("$.events.length()").value(3))
+                    .andExpect(jsonPath("$.workflow.step").value("PACKED"));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private org.springframework.test.web.servlet.ResultActions recover(String id, String action, String preview)
+            throws Exception {
+        JsonNode data = mapper.readTree(preview);
+        String payload = mapper.writeValueAsString(Map.of(
+                "action", action,
+                "expectedSequence", data.get("expectedSequence").asLong(),
+                "expectedHash", data.get("expectedHash").asText(),
+                "projectionFingerprint", data.get("projectionFingerprint").asText()));
+        return authorizedPost("/api/workflows/" + id + "/recover", payload);
     }
 
     private String create(String name) throws Exception {
@@ -108,8 +274,14 @@ class WorkflowIntegrationTest {
     }
 
     private org.springframework.test.web.servlet.ResultActions authorizedPost(String path, String body) throws Exception {
-        var request = post(path).with(httpBasic("resurrection", "dev-only-change-me"));
+        return authorizedPost(path, body, null);
+    }
+
+    private org.springframework.test.web.servlet.ResultActions authorizedPost(String path, String body, String key)
+            throws Exception {
+        MockHttpServletRequestBuilder request = post(path).with(httpBasic("resurrection", "dev-only-change-me"));
         if (body != null) request.contentType(MediaType.APPLICATION_JSON).content(body);
+        if (key != null) request.header("Idempotency-Key", key);
         return mvc.perform(request);
     }
 }

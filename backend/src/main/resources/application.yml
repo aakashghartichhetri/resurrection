@@ -1,5 +1,7 @@
 server:
   port: 8081
+  shutdown: graceful
+  forward-headers-strategy: framework
 spring:
   datasource:
     url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/resurrection}
@@ -11,7 +13,21 @@ spring:
       ddl-auto: validate
   flyway:
     enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db
 app:
   username: ${APP_USERNAME:resurrection}
   password: ${APP_PASSWORD:dev-only-change-me}
+  production: ${APP_PRODUCTION:false}
   seed-demo: ${APP_SEED_DEMO:true}
+  faults-enabled: ${APP_FAULTS_ENABLED:true}

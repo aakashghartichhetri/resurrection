@@ -23,8 +23,10 @@ public class SecurityConfig {
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers(HttpMethod.GET, "/api/health").permitAll()
-                        .anyRequest().authenticated())
+                        .requestMatchers(HttpMethod.GET, "/api/health",
+                                "/actuator/health", "/actuator/health/liveness",
+                                "/actuator/health/readiness").permitAll()
+                        .anyRequest().hasRole("OPERATOR"))
                 .httpBasic(Customizer.withDefaults())
                 .build();
     }
@@ -35,7 +37,12 @@ public class SecurityConfig {
     @Bean
     UserDetailsService users(@Value("${app.username}") String username,
                              @Value("${app.password}") String password,
+                             @Value("${app.production:false}") boolean production,
                              PasswordEncoder encoder) {
+        if (production && (username.isBlank() || username.length() > 100 || password.length() < 20
+                || "dev-only-change-me".equals(password))) {
+            throw new IllegalStateException("Production requires a non-empty username and a unique 20+ character password");
+        }
         return new InMemoryUserDetailsManager(User.withUsername(username)
                 .password(encoder.encode(password)).roles("OPERATOR").build());
     }

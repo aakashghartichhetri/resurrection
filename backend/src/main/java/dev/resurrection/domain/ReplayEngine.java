@@ -20,13 +20,14 @@ public final class ReplayEngine {
                              String lastEventHash, String checksum) { }
 
     public record Result(WorkflowState state, long lastSequence, String lastHash,
-                         int verifiedCheckpoints) { }
+                         int verifiedCheckpoints, boolean expectedFaultArmed) { }
 
     public static Result replay(UUID workflowId, List<Event> events, List<Checkpoint> checkpoints) {
         WorkflowState state = null;
         String previousHash = GENESIS;
         long sequence = 0;
         int checkpointIndex = 0;
+        boolean faultArmed = false;
         for (Event event : events) {
             sequence++;
             if (!workflowId.equals(event.workflowId()) || event.sequence() != sequence
@@ -34,24 +35,39 @@ public final class ReplayEngine {
                     || !hashEvent(event).equals(event.hash())) {
                 throw new ReplayException("Event history integrity check failed at sequence " + sequence);
             }
+            // Failure injection is itself a state machine; a replay cannot invent a failure.
+            if (event.type() == EventType.FAULT_ARMED) {
+                if (faultArmed || state == null || state.status() != WorkflowStatus.ACTIVE)
+                    throw new ReplayException("Invalid FAULT_ARMED at sequence " + sequence);
+                faultArmed = true;
+            } else if (event.type() == EventType.STEP_FAILED) {
+                if (!faultArmed)
+                    throw new ReplayException("STEP_FAILED has no preceding armed fault at sequence " + sequence);
+                faultArmed = false;
+            } else if (event.type() == EventType.ADVANCED && faultArmed) {
+                throw new ReplayException("ADVANCED bypasses an armed fault at sequence " + sequence);
+            }
             state = apply(state, event.type());
             previousHash = event.hash();
-            if (checkpointIndex < checkpoints.size()
-                    && checkpoints.get(checkpointIndex).sequence() == sequence) {
+            // Every second event must have a checkpoint. A deleted checkpoint is an integrity failure,
+            // not a reason to silently trust a shorter snapshot history.
+            if (sequence % 2 == 0) {
+                if (checkpointIndex >= checkpoints.size()
+                        || checkpoints.get(checkpointIndex).sequence() != sequence) {
+                    throw new ReplayException("Missing checkpoint at sequence " + sequence);
+                }
                 Checkpoint saved = checkpoints.get(checkpointIndex++);
                 if (!saved.checksum().equals(checkpointChecksum(workflowId, saved))
                         || saved.step() != state.step() || saved.status() != state.status()
                         || !saved.lastEventHash().equals(previousHash)) {
                     throw new ReplayException("Checkpoint integrity check failed at sequence " + sequence);
                 }
-                // A verified checkpoint is a safe starting point for the remaining events.
-                state = new WorkflowState(saved.step(), saved.status());
             }
         }
         if (state == null || checkpointIndex != checkpoints.size()) {
             throw new ReplayException("Event history or checkpoint sequence is incomplete");
         }
-        return new Result(state, sequence, previousHash, checkpointIndex);
+        return new Result(state, sequence, previousHash, checkpointIndex, faultArmed);
     }
 
     public static WorkflowState apply(WorkflowState current, EventType type) {
@@ -92,6 +108,12 @@ public final class ReplayEngine {
     public static String checkpointChecksum(UUID id, Checkpoint checkpoint) {
         return sha256(id + "\n" + checkpoint.sequence() + "\n" + checkpoint.step()
                 + "\n" + checkpoint.status() + "\n" + checkpoint.lastEventHash());
+    }
+
+    /** Fingerprint invalidates previews when the stored projection changes. */
+    public static String projectionFingerprint(UUID workflowId, int step, WorkflowStatus status,
+                                               long sequence, boolean faultArmed) {
+        return sha256(workflowId + "\n" + step + "\n" + status + "\n" + sequence + "\n" + faultArmed);
     }
 
     private static String sha256(String input) {
