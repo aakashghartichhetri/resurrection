@@ -47,9 +47,76 @@ class WorkflowIntegrationTest {
     @Autowired JdbcTemplate jdbc;
 
     @Test
+    void flywayCreatedTheHistoryAndOperationalIndexes() {
+        Integer applied = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM flyway_schema_history
+                WHERE success = true AND version IN ('1', '2', '3', '4')
+                """, Integer.class);
+        assertEquals(4, applied);
+        Integer indexes = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM pg_indexes
+                WHERE tablename = 'workflow_events' AND indexname = 'idx_workflow_events_recent'
+                """, Integer.class);
+        assertEquals(1, indexes);
+    }
+
+    @Test
     void unauthenticatedRequestsAreRejected() throws Exception {
         mvc.perform(get("/api/workflows")).andExpect(status().isUnauthorized());
         mvc.perform(get("/api/health")).andExpect(status().isOk());
+    }
+
+    @Test
+    void requestIdsAreReturnedAndInvalidIdentifiersAreReplaced() throws Exception {
+        mvc.perform(get("/api/workflows").with(httpBasic("resurrection", "dev-only-change-me"))
+                        .header("X-Request-Id", "operator-investigation-123"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Request-Id", "operator-investigation-123"));
+        mvc.perform(get("/api/workflows").header("X-Request-Id", "unsafe request"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(header().exists("X-Request-Id"));
+    }
+
+    @Test
+    void validationErrorsIncludeAReferenceForSupport() throws Exception {
+        mvc.perform(post("/api/workflows")
+                        .with(httpBasic("resurrection", "dev-only-change-me"))
+                        .header("X-Request-Id", "validation-test-123")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"   \"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().string("X-Request-Id", "validation-test-123"))
+                .andExpect(jsonPath("$.requestId").value("validation-test-123"));
+    }
+
+    @Test
+    void metricsAreProtectedByOperatorCredentials() throws Exception {
+        mvc.perform(get("/actuator/metrics")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/actuator/metrics")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void aViewerCannotReadOrChangeWorkflows() throws Exception {
+        mvc.perform(get("/api/workflows")
+                .with(org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors
+                        .user("viewer").roles("VIEWER"))).andExpect(status().isForbidden());
+        mvc.perform(post("/api/workflows").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"name\":\"Unauthorized write\"}")
+                .with(org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors
+                        .user("viewer").roles("VIEWER"))).andExpect(status().isForbidden());
+    }
+
+    @Test
+    void rejectsMalformedRecoveryIdentifiersAndInvalidFaultTypes() throws Exception {
+        String id = create("Invalid operator input");
+        authorizedPost("/api/workflows/" + id + "/faults", "{\"type\":\"SOMETHING_ELSE\"}")
+                .andExpect(status().isBadRequest());
+        authorizedPost("/api/workflows/" + id + "/recover", """
+                {"action":"REBUILD_PROJECTION","expectedSequence":1,
+                 "expectedHash":"wrong","projectionFingerprint":"wrong"}
+                """).andExpect(status().isBadRequest());
     }
 
     @Test
@@ -236,6 +303,40 @@ class WorkflowIntegrationTest {
     }
 
     @Test
+    void aFailedApprovalAuditInsertRollsBackTheRecoveryEventAndProjection() throws Exception {
+        String id = create("Rollback when audit write fails");
+        authorizedPost("/api/workflows/" + id + "/faults", "{\"type\":\"FAIL_NEXT_STEP\"}");
+        authorizedPost("/api/workflows/" + id + "/advance", null);
+        String preview = mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andReturn().getResponse().getContentAsString();
+        long before = jdbc.queryForObject("SELECT last_sequence FROM workflows WHERE id = ?",
+                Long.class, UUID.fromString(id));
+        jdbc.execute("""
+                CREATE FUNCTION reject_recovery_test() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'simulated audit store outage'; END $$
+                """);
+        jdbc.execute("""
+                CREATE TRIGGER reject_recovery_test BEFORE INSERT ON recovery_approvals
+                FOR EACH ROW EXECUTE FUNCTION reject_recovery_test()
+                """);
+        try {
+            assertThrows(Exception.class, () -> recover(id, "RESUME_AFTER_FAILURE", preview));
+            assertEquals(before, jdbc.queryForObject("SELECT last_sequence FROM workflows WHERE id = ?",
+                    Long.class, UUID.fromString(id)));
+            assertEquals("FAILED", jdbc.queryForObject("SELECT status FROM workflows WHERE id = ?",
+                    String.class, UUID.fromString(id)));
+            assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM recovery_approvals WHERE workflow_id = ?",
+                    Integer.class, UUID.fromString(id)));
+            assertEquals(before, jdbc.queryForObject("SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ?",
+                    Long.class, UUID.fromString(id)));
+        } finally {
+            jdbc.execute("DROP TRIGGER IF EXISTS reject_recovery_test ON recovery_approvals");
+            jdbc.execute("DROP FUNCTION IF EXISTS reject_recovery_test()");
+        }
+    }
+
+    @Test
     void serializesTwoConcurrentAdvancesWithoutLosingSequenceNumbers() throws Exception {
         String id = create("Concurrent command demo");
         var executor = Executors.newFixedThreadPool(2);
@@ -250,6 +351,83 @@ class WorkflowIntegrationTest {
                     .andExpect(jsonPath("$.workflow.lastSequence").value(3))
                     .andExpect(jsonPath("$.events.length()").value(3))
                     .andExpect(jsonPath("$.workflow.step").value("PACKED"));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void sameKeyOnDifferentWorkflowsCannotRaceIntoA500() throws Exception {
+        String one = create("Shared key first workflow");
+        String two = create("Shared key second workflow");
+        String key = UUID.randomUUID().toString();
+        var executor = Executors.newFixedThreadPool(2);
+        var ready = new java.util.concurrent.CountDownLatch(2);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            java.util.concurrent.Callable<Integer> first = () -> {
+                ready.countDown();
+                release.await();
+                return authorizedPost("/api/workflows/" + one + "/advance", null, key)
+                        .andReturn().getResponse().getStatus();
+            };
+            java.util.concurrent.Callable<Integer> second = () -> {
+                ready.countDown();
+                release.await();
+                return authorizedPost("/api/workflows/" + two + "/advance", null, key)
+                        .andReturn().getResponse().getStatus();
+            };
+            var a = executor.submit(first);
+            var b = executor.submit(second);
+            assertTrue(ready.await(10, TimeUnit.SECONDS));
+            release.countDown();
+            var responses = java.util.List.of(a.get(20, TimeUnit.SECONDS), b.get(20, TimeUnit.SECONDS));
+            assertTrue(responses.contains(200), "One request must win the key");
+            assertTrue(responses.contains(409), "The other must report key reuse, not HTTP 500");
+            Integer firstEvents = jdbc.queryForObject("SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ?",
+                    Integer.class, UUID.fromString(one));
+            Integer secondEvents = jdbc.queryForObject("SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ?",
+                    Integer.class, UUID.fromString(two));
+            assertEquals(3, firstEvents + secondEvents); // Two CREATED events plus one ADVANCED.
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void twoSimultaneousRecoveryApprovalsCannotBothCommit() throws Exception {
+        String id = create("Concurrent recovery approval");
+        authorizedPost("/api/workflows/" + id + "/faults", "{\"type\":\"FAIL_NEXT_STEP\"}");
+        authorizedPost("/api/workflows/" + id + "/advance", null);
+        String preview = mvc.perform(get("/api/workflows/" + id + "/recovery-preview")
+                .with(httpBasic("resurrection", "dev-only-change-me")))
+                .andReturn().getResponse().getContentAsString();
+        JsonNode data = mapper.readTree(preview);
+        String payload = mapper.writeValueAsString(Map.of(
+                "action", "RESUME_AFTER_FAILURE",
+                "expectedSequence", data.get("expectedSequence").asLong(),
+                "expectedHash", data.get("expectedHash").asText(),
+                "projectionFingerprint", data.get("projectionFingerprint").asText()));
+        var executor = Executors.newFixedThreadPool(2);
+        var ready = new java.util.concurrent.CountDownLatch(2);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            java.util.concurrent.Callable<Integer> approve = () -> {
+                ready.countDown();
+                release.await();
+                return authorizedPost("/api/workflows/" + id + "/recover", payload)
+                        .andReturn().getResponse().getStatus();
+            };
+            var a = executor.submit(approve);
+            var b = executor.submit(approve);
+            assertTrue(ready.await(10, TimeUnit.SECONDS));
+            release.countDown();
+            var responses = java.util.List.of(a.get(20, TimeUnit.SECONDS), b.get(20, TimeUnit.SECONDS));
+            assertTrue(responses.contains(200));
+            assertTrue(responses.contains(409));
+            Integer approvals = jdbc.queryForObject("SELECT COUNT(*) FROM recovery_approvals WHERE workflow_id = ?",
+                    Integer.class, UUID.fromString(id));
+            assertEquals(1, approvals);
         } finally {
             executor.shutdownNow();
         }

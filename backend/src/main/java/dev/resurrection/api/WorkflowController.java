@@ -20,11 +20,11 @@ public class WorkflowController {
     public WorkflowController(WorkflowService service) { this.service = service; }
 
     public record NewWorkflow(@NotBlank @Size(max = 100) String name) { }
-    public record Fault(@NotBlank String type) { }
+    public record Fault(@NotBlank @Pattern(regexp = "FAIL_NEXT_STEP|CORRUPT_PROJECTION") String type) { }
     public record Approval(@Pattern(regexp = "REBUILD_PROJECTION|RESUME_AFTER_FAILURE") String action,
                            @Min(1) long expectedSequence,
-                           @NotBlank String expectedHash,
-                           @NotBlank String projectionFingerprint) { }
+                           @NotBlank @Pattern(regexp = "[a-f0-9]{64}") String expectedHash,
+                           @NotBlank @Pattern(regexp = "[a-f0-9]{64}") String projectionFingerprint) { }
 
     @GetMapping("/health")
     public Map<String, String> health() { return Map.of("status", "UP"); }
