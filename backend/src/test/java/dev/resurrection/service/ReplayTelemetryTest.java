@@ -19,7 +19,7 @@ class ReplayTelemetryTest {
                 ReplayEngine.GENESIS, "");
         var valid = new ReplayEngine.Event(id, 1, EventType.CREATED, "created",
                 ReplayEngine.GENESIS, ReplayEngine.hashEvent(unsigned));
-        try (var registry = new SimpleMeterRegistry()) {
+        var registry = new SimpleMeterRegistry();
             var telemetry = new ReplayTelemetry(registry);
             assertEquals(1, telemetry.verify(id, List.of(valid), List.of()).lastSequence());
             assertThrows(ReplayException.class, () -> telemetry.verify(id,
@@ -31,6 +31,5 @@ class ReplayTelemetryTest {
                     .tag("outcome", "invalid").counter().count());
             assertEquals(1L, registry.get("resurrection.replay.duration")
                     .tag("outcome", "invalid").timer().count());
-        }
     }
 }
