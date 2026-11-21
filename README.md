@@ -1,34 +1,34 @@
-# RESURRECTION — Workflow Recovery
+# RESURRECTION 
 
-**Know what failed. Recover with confidence.**
+**A Java and React application that records workflow transitions, reconstructs failed dispatches from verified events, and lets an operator approve a safe recovery.**
 
-RESURRECTION is a full-stack operator workspace for understanding failed workflows. It saves each step in PostgreSQL, reconstructs the expected state from a verified event history, and asks an operator to approve recovery before changing anything.
+## Why it exists
 
-## Overview
+A warehouse dispatch can fail between validation and packing. After a restart, an ordinary status field may not explain what actually committed. RESURRECTION is a small investigation workspace for engineers and operators: it records each step, checks the history, and explains whether the saved state can be trusted. All dispatches are **simulated**; this application does not contact shipping or payment services.
 
-Imagine a warehouse dispatch stops after validation. Did packing finish? Was the database updated? Is it safe to retry?
+## What it can do
 
-The workspace answers those questions using **deterministic event replay**, rather than simply trusting the latest saved status. The sample dispatches are simulated; nothing is shipped or charged in the real world.
+- **Monitor workflows:** Search dispatches, see which need attention, and inspect recent transitions.
+- **Replay event history:** Validate ordered, SHA-256-linked events and checkpoints before reconstructing state.
+- **Practice failures:** Inject a stopped transition or corrupt a saved projection in the local demo.
+- **Review recovery:** Preview a suggested action, detect stale approvals, and keep an operator audit trail.
+- **Handle retries safely:** Use database transactions, workflow row locks, and idempotency keys to avoid duplicate transitions.
+- **Investigate problems:** Export evidence and match API errors to server logs using request IDs.
 
-## Tech Stack
+## Stack and architecture
 
-- **Frontend:** React, TypeScript, Vite, responsive CSS
-- **Backend:** Java 25, Spring Boot, Spring MVC, Spring Security, JPA
-- **Data:** PostgreSQL, Flyway, hash-linked events, checkpoints
-- **Testing:** JUnit, Testcontainers, frontend logic tests, API smoke test
-- **Deployment:** Docker Compose, Nginx, Caddy HTTPS, GitHub Actions
+**Java 25**, Spring Boot 3.5, Spring MVC, Spring Security, Spring Data JPA, PostgreSQL 17, Flyway, JUnit, Testcontainers, React 19, TypeScript, Vite, Nginx, Docker Compose, and GitHub Actions. Caddy provides HTTPS for a single-operator deployment.
 
-## Key Features
+```text
+Browser → Nginx → Spring Boot API → PostgreSQL
+                     │                 ├─ Workflow projection
+                     ├─ Commands        ├─ Events & checkpoints
+                     └─ Replay & audit  └─ Approvals
+```
 
-- **Operations overview:** Find the most urgent incident, inspect live workflow totals, and jump directly to an investigation.
-- **Workflow register:** Search and filter dispatches, follow their progress, and advance valid steps.
-- **Replay and recovery:** Check event hashes and checkpoints, compare reconstructed and saved state, preview a repair, and record an approval. Invalid history blocks recovery.
-- **Failure drills:** Simulate a failed step or corrupted saved state in the local demonstration.
-- **Audit history:** Review events, approvals, and fault tests; export a JSON evidence report.
+## Get started
 
-## Getting Started
-
-**Prerequisite:** Docker Desktop or Docker Engine with Compose v2. No local Java or Node installation is required.
+**Prerequisite:** Docker Desktop or Docker Engine with Compose v2. You do not need Java, Maven, Node, or PostgreSQL installed on your computer to start the stack.
 
 ```bash
 cp .env.example .env
@@ -36,47 +36,32 @@ docker compose -p resurrection up -d --build --wait
 docker compose -p resurrection ps
 ```
 
-Open **http://localhost:8080** and sign in with the local example credentials: `resurrection` / `dev-only-change-me`. The backend listens on `http://localhost:8081`; PostgreSQL is not exposed to the host.
+Open **http://localhost:8080**. The development login is `resurrection` / `dev-only-change-me`; change it in `.env` before any shared use. PostgreSQL stays inside Docker. Keep the Compose project name and existing `.env` when upgrading so the original database volume is reused. Do **not** run `down -v` if you need your data.
 
-**Important:** Change the values in `.env` before using this beyond your own machine. If upgrading an existing installation, **keep its original `.env`** rather than copying the example. PostgreSQL passwords do not automatically change inside an existing volume.
+To try recovery, open **Practice a recovery**, start a simulated incident, inspect it in **Investigations**, review the proposed action, then approve. The approval appears in **Audit history**. If event history is invalid, the app blocks repair rather than guessing.
 
-## Try a Recovery
-
-1. Select **Practice a recovery** and start a drill.
-2. Open **Investigations**. Compare the stored state with the replayed result and read the causal timeline.
-3. Review the proposed action, approve it, and inspect the decision in **Audit history**.
-4. Continue the workflow in **Workflow register** and export the evidence if needed.
-
-## Testing
+## Tests and checks
 
 ```bash
-# With the local stack running
-bash scripts/smoke-test.sh
-
-# Full backend and frontend suites (JDK 25, Maven, Node.js 22 and Docker)
-(cd backend && mvn -B verify)
+bash scripts/replay-check.sh                  # Pure Java integrity checks
+bash scripts/replay-benchmark.sh              # Replay-only microbenchmark
+bash scripts/smoke-test.sh                    # With Compose running
+bash scripts/restart-check.sh                 # Restart API in a test stack only
+bash scripts/verify-backup.sh                 # Disposable PostgreSQL restore
+(cd backend && mvn -B verify)                 # JDK 25, Maven, Docker
 (cd frontend && npm install && npm test && npm run build)
-
-# Stop, preserving your database
-docker compose -p resurrection down
+docker compose -p resurrection down           # Preserves database volume
 ```
 
-GitHub Actions runs the tests and builds the complete local Compose stack. For repeatable frontend installs, run `npm install` on a networked machine and commit the generated `frontend/package-lock.json`.
+The pure-Java check and frontend logic tests passed in the authoring environment. Full Maven/Testcontainers, frontend bundle, Docker startup, database restore, and remote CI are **UNVERIFIED** for this revision. See [Testing](docs/TESTING.md) and [Replay benchmarks](docs/BENCHMARKS.md) for measured results and precise limits. A fully resolved `frontend/package-lock.json` still needs to be generated and committed from a networked machine for reproducible `npm ci` builds.
 
-## Architecture
+## Engineering decisions
 
-```text
-React dashboard → Nginx → Spring Boot API → PostgreSQL
-                            ├─ Workflow commands and approval audit
-                            └─ Deterministic replay and checkpoints
-```
+- **Events are evidence; projections are convenience.** Replay detects disagreement instead of silently overwriting it.
+- **Atomic operations matter.** Event writes, checkpoints, command results, and projection updates commit or roll back together.
+- **An approval is conditional.** Recovery rechecks the latest history and saved-state fingerprint while holding a row lock.
+- **Keep the architecture small.** The current use case does not require Kafka, Kubernetes, or distributed workers.
 
-Database transactions keep state changes and events together. Idempotency keys protect retry requests, and row locking protects concurrent updates. The interface refreshes the operations view automatically while keeping recovery approval manual.
+## Limitations and deployment
 
-## Deployment and Scope
-
-`compose.deploy.yaml` and `deploy/Caddyfile` support **single-operator HTTPS deployment** with a private API and database. Set a real domain and strong credentials with `deploy/.env.production.example`; production mode disables sample data and fault injection.
-
-This is a **functional recovery demonstration and potential single-operator pilot**, not a finished multi-customer SaaS. It does not repair arbitrary external services or provide customer accounts, tenant isolation, billing, password recovery, enterprise monitoring, or a contractual availability guarantee. Those require additional development and testing before accepting paying customers.
-
-To upgrade without losing data, back up PostgreSQL first and reuse the Compose project name `resurrection`. Do not run `docker compose down -v` unless you intend to delete the saved database.
+This is a **single-operator lab**, not a production multi-tenant recovery platform. Hash chains detect accidental modification but cannot stop a database administrator from rewriting and rehashing history. It has no real-world side-effect reconciliation, MFA, customer isolation, or uptime guarantees. For hosted HTTPS setup and operational boundaries, read [Architecture](docs/ARCHITECTURE.md), [Security](docs/SECURITY.md), and the [Runbook](docs/RUNBOOK.md). Do not expose the local demo configuration to the public internet.

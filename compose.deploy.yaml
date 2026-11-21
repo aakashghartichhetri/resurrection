@@ -26,6 +26,7 @@ services:
       APP_USERNAME: ${APP_USERNAME:?Set APP_USERNAME in .env}
       APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in .env}
       APP_PRODUCTION: "true"
+      LOGGING_STRUCTURED_FORMAT_CONSOLE: ecs
       APP_SEED_DEMO: "false"
       APP_FAULTS_ENABLED: "false"
     depends_on:

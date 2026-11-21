@@ -5,6 +5,18 @@ on:
 permissions:
   contents: read
 jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Run replay safety check without database dependencies
+        run: bash scripts/replay-check.sh
+
   backend:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -36,6 +48,9 @@ jobs:
           else
             npm install --no-audit --no-fund
           fi
+      - name: Audit frontend dependency vulnerabilities
+        working-directory: frontend
+        run: npm audit --audit-level=high
       - name: UI logic tests
         working-directory: frontend
         run: npm test
@@ -45,7 +60,7 @@ jobs:
 
   smoke:
     runs-on: ubuntu-latest
-    needs: [backend, frontend]
+    needs: [replay, backend, frontend]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +68,10 @@ jobs:
         run: docker compose up -d --build --wait
       - name: End-to-end workflow, retry, failure and recovery checks
         run: bash scripts/smoke-test.sh
+      - name: Verify workflow history survives API restart
+        run: bash scripts/restart-check.sh
+      - name: Verify PostgreSQL backup can restore into disposable database
+        run: bash scripts/verify-backup.sh
       - name: Logs when something fails
         if: failure()
         run: docker compose logs --tail=250

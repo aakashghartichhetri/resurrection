@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 import java.time.Instant;
@@ -21,18 +22,22 @@ public class WorkflowService {
     private final EventRepository events;
     private final CheckpointRepository checkpoints;
     private final CommandRepository commands;
+    private final JdbcTemplate jdbc;
+    private final ReplayTelemetry replayTelemetry;
     private final RecoveryApprovalRepository approvals;
     private final FaultAuditRepository faults;
     private final boolean faultsEnabled;
 
     public WorkflowService(WorkflowRepository workflows, EventRepository events,
-                           CheckpointRepository checkpoints, CommandRepository commands,
-                           RecoveryApprovalRepository approvals, FaultAuditRepository faults,
+                           CheckpointRepository checkpoints, CommandRepository commands, JdbcTemplate jdbc,
+                           ReplayTelemetry replayTelemetry, RecoveryApprovalRepository approvals, FaultAuditRepository faults,
                            @Value("${app.faults-enabled:true}") boolean faultsEnabled) {
         this.workflows = workflows;
         this.events = events;
         this.checkpoints = checkpoints;
         this.commands = commands;
+        this.jdbc = jdbc;
+        this.replayTelemetry = replayTelemetry;
         this.approvals = approvals;
         this.faults = faults;
         this.faultsEnabled = faultsEnabled;
@@ -144,6 +149,14 @@ public class WorkflowService {
     /** A request key makes network retries safe even after the first response is lost. */
     @Transactional
     public WorkflowView advance(UUID id, UUID requestKey) {
+        // Lock the request key before the workflow row. Two distinct workflows can otherwise race
+        // on the commands primary key and turn a legitimate retry into an HTTP 500.
+        // A 64-bit hash collision only adds waiting; the UUID remains the uniqueness check.
+        if (requestKey != null) {
+            long lockKey = requestKey.getMostSignificantBits()
+                    ^ Long.rotateLeft(requestKey.getLeastSignificantBits(), 1);
+            jdbc.query("SELECT pg_advisory_xact_lock(?)", rs -> { }, lockKey);
+        }
         WorkflowEntity workflow = locked(id);
         if (requestKey != null) {
             var previous = commands.findById(requestKey);
@@ -296,7 +309,7 @@ public class WorkflowService {
                 .map(EventEntity::toRecord).toList();
         var saved = checkpoints.findByWorkflowIdOrderBySequenceAsc(id).stream()
                 .map(CheckpointEntity::toRecord).toList();
-        return ReplayEngine.replay(id, history, saved);
+        return replayTelemetry.verify(id, history, saved);
     }
 
     private void append(WorkflowEntity workflow, EventType type, String message) {

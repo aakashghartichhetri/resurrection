@@ -17,7 +17,8 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        # Metrics require OPERATOR authentication; health stays public for Docker probes.
+        include: health,info,metrics
   endpoint:
     health:
       probes:
@@ -31,3 +32,7 @@ app:
   production: ${APP_PRODUCTION:false}
   seed-demo: ${APP_SEED_DEMO:true}
   faults-enabled: ${APP_FAULTS_ENABLED:true}
+
+logging:
+  pattern:
+    level: "%5p [requestId:%X{requestId:-none}]"

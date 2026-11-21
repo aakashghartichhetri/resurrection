@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { buildEvidence, formatDate, formatTime, recoveryLabel } from './evidence'
+import { explainApiError } from './httpErrors'
 import { filterFleet, healthLabels, needsAttention, pipeline, triage } from './operations'
 import type { FleetFilter } from './operations'
 import type { Detail, FaultAudit, HealthState, Operations, Preview, Workflow, WorkflowEvent, WorkflowHealth, WorkflowStatus } from './types'
@@ -178,6 +179,7 @@ export default function App() {
       method,
       headers: {
         Authorization: `Basic ${encoded}`,
+        'X-Request-Id': crypto.randomUUID(),
         ...(body ? { 'Content-Type': 'application/json' } : {}),
         ...(key ? { 'Idempotency-Key': key } : {})
       },
@@ -185,8 +187,7 @@ export default function App() {
     })
     if (!response.ok) {
       const data = await response.json().catch(() => ({})) as { error?: string }
-      throw new Error(response.status === 401 ? 'That username or password did not work.' :
-        data.error ?? `The request failed (HTTP ${response.status}).`)
+      throw new Error(explainApiError(response.status, data.error, response.headers.get('X-Request-Id')))
     }
     return response.json() as Promise<T>
   }, [username, password])

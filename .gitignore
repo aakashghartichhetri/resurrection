@@ -13,3 +13,5 @@
 *.log
 *.dump
 resurrection-*-evidence.json
+**/__pycache__/
+**/*.pyc
